@@ -15,7 +15,7 @@ class SimCLR(nn.Module):
         self.temperature = 0.5
         self.projection_dim = 128
 
-        if dataset == 'cifar10':
+        if dataset in ('cifar10', 'tiny'):
             resnet = resnet_v1((3, 32, 32), 50, 1, cifar_stem=True)
             resnet = SyncBatchNorm.convert_sync_batchnorm(resnet)
             self.resnet = resnet

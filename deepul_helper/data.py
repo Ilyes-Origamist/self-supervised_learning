@@ -1,3 +1,4 @@
+import os
 import os.path as osp
 import random
 
@@ -7,9 +8,25 @@ import cv2
 import torchvision.transforms.functional as F
 from torchvision import datasets
 from torchvision import transforms
+from torch.utils.data import Subset # for stratified smaller dataset
 
+from torch.utils.data import Dataset # for wrapping Hugging Face image datasets
 
+from PIL import Image
+from torch.utils.data import Dataset
+
+class ArrayImages(Dataset):
+    def __init__(self, x, y, transform):
+        self.x, self.y, self.transform = x, y, transform
+
+    def __len__(self):
+        return len(self.x)
+
+    def __getitem__(self, i):
+        return self.transform(Image.fromarray(self.x[i])), int(self.y[i])
+    
 def get_transform(dataset, task, train=True):
+    pre = [transforms.Resize(32)] if dataset == 'tiny' else []
     transform = None
     if task == 'context_encoder':
         if dataset == 'cifar10':
@@ -17,6 +34,13 @@ def get_transform(dataset, task, train=True):
                 transforms.Resize(128),
                 transforms.ToTensor(),
                 transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))
+            ])
+        elif dataset == 'tiny':
+            # 64x64 upsampled to the 128x128 input the context encoder expects
+            transform = transforms.Compose([
+                transforms.Resize(128),
+                transforms.ToTensor(),
+                transforms.Normalize((0.4802, 0.4481, 0.3975), (0.2770, 0.2691, 0.2821))
             ])
         elif 'imagenet' in dataset:
             transform = transforms.Compose([
@@ -47,12 +71,18 @@ def get_transform(dataset, task, train=True):
                     transforms.ToTensor(),
                     transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
                 ])
-            else:
-                transform = transforms.Compose([
-                    transforms.Resize(256),
-                    transforms.CenterCrop(224),
+        elif dataset == 'tiny':
+            if train:
+                transform = transforms.Compose(pre + [
+                    transforms.RandomCrop(32, padding=4),
+                    transforms.RandomHorizontalFlip(),
                     transforms.ToTensor(),
-                    transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+                    transforms.Normalize((0.4802, 0.4481, 0.3975), (0.2770, 0.2691, 0.2821))
+                ])
+            else:
+                transform = transforms.Compose(pre + [
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.4802, 0.4481, 0.3975), (0.2770, 0.2691, 0.2821))
                 ])
     elif task == 'cpc':
         if train:
@@ -104,6 +134,21 @@ def get_transform(dataset, task, train=True):
                     transforms.CenterCrop(128),
                     transforms.ToTensor(),
                     transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+                ])
+        elif dataset == 'tiny':
+            if train:
+                transform = transforms.Compose([
+                    transforms.RandomResizedCrop(32),
+                    transforms.RandomHorizontalFlip(p=0.5),
+                    transforms.RandomApply([transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
+                    transforms.RandomGrayscale(p=0.2),
+                    transforms.ToTensor(),
+                    transforms.Normalize([0.4802, 0.4481, 0.3975], [0.2770, 0.2691, 0.2821])
+                ])
+            else:
+                transform = transforms.Compose(pre + [
+                    transforms.ToTensor(),
+                    transforms.Normalize([0.4802, 0.4481, 0.3975], [0.2770, 0.2691, 0.2821])
                 ])
         transform = SimCLRDataTransform(transform)
     elif task == 'segmentation':
@@ -162,6 +207,12 @@ def get_datasets(dataset, task):
                                              transforms=get_transform(dataset, task, train=False),
                                              download=True)
         return train_dset, test_dset, 21
+    elif dataset == 'tiny':
+        d = np.load(osp.join('data', 'tiny', 'tiny_subset.npz'))
+        xtr, ytr, xte, yte = d['xtr'], d['ytr'], d['xte'], d['yte']
+        train_dset = ArrayImages(xtr, ytr, get_transform(dataset, task, train=True))
+        test_dset = ArrayImages(xte, yte, get_transform(dataset, task, train=False))
+        return train_dset, test_dset, 200
     else:
         raise Exception('Invalid dataset:', dataset)
 

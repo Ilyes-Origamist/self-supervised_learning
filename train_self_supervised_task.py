@@ -35,6 +35,8 @@ parser.add_argument('-u', '--warmup_epochs', type=int, default=0,
 
 parser.add_argument('-p', '--port', type=int, default=23456, help='tcp port for distributed trainign (default: 23456)')
 parser.add_argument('-i', '--log_interval', type=int, default=10, help='default: 10')
+parser.add_argument('-r', '--resume', action='store_true',
+                    help='resume from results/<dataset>_<task>/checkpoint.pth.tar')
 
 
 best_loss = float('inf')
@@ -64,13 +66,13 @@ def main_worker(gpu, ngpus, args):
     train_dataset, val_dataset, n_classes = get_datasets(args.dataset, args.task)
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, num_workers=16,
+        train_dataset, batch_size=args.batch_size, num_workers=min(16, os.cpu_count()), persistent_workers=True,
         pin_memory=True, sampler=train_sampler, drop_last=True
     )
 
     val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset)
     val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=args.batch_size, num_workers=16,
+        val_dataset, batch_size=args.batch_size, num_workers=min(16, os.cpu_count()), persistent_workers=True,
         pin_memory=True, drop_last=True, sampler=val_sampler
     )
 
@@ -121,11 +123,26 @@ def main_worker(gpu, ngpus, args):
     if args.warmup_epochs > 0:
         scheduler = GradualWarmupScheduler(optimizer, multiplier=total_batch_size / 256.,
                                            total_epoch=args.warmup_epochs, after_scheduler=scheduler)
-        scheduler_linear = GradualWarmupScheduler(optimizer, multiplier=total_batch_size / 256.,
+        scheduler_linear = GradualWarmupScheduler(optimizer_linear, multiplier=total_batch_size / 256.,
                                                   total_epoch=args.warmup_epochs,
                                                   after_scheduler=scheduler_linear)
 
-    for epoch in range(args.epochs):
+    start_epoch = 0
+    if args.resume:
+        ckpt_path = osp.join(args.output_dir, 'checkpoint.pth.tar')
+        # weights_only=False: the checkpoint stores numpy scalars (best_loss, best_acc)
+        ckpt = torch.load(ckpt_path, map_location=f'cuda:{gpu}', weights_only=False)
+        model.load_state_dict(ckpt['state_dict'])
+        linear_classifier.load_state_dict(ckpt['state_dict_linear'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+        optimizer_linear.load_state_dict(ckpt['optimizer_linear'])
+        scheduler.load_state_dict(ckpt['scheduler'])
+        scheduler_linear.load_state_dict(ckpt['schedular_linear'])
+        best_loss = ckpt['best_loss']
+        start_epoch = ckpt['epoch']
+        print(f'Resumed from {ckpt_path} at epoch {start_epoch} (best_loss {best_loss:.4f})')
+
+    for epoch in range(start_epoch, args.epochs):
         train_sampler.set_epoch(epoch)
 
         train(train_loader, model, linear_classifier,

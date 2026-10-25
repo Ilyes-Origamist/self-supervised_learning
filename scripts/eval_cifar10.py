@@ -1,0 +1,118 @@
+
+# from deepul_helper.demos import evaluate_classifier, load_model_and_data, evaluate_accuracy, display_nearest_neighbors, show_context_encoder_inpainting 
+# import json
+
+# results = {'context_encoder': {}, 'rotation': {}, 'simclr': {}}
+
+# # TASK : Evaluate different pretrained self-supervised models with different pretext-tasks on CIFAR-10
+# tasks = ["context_encoder", "rotation", "simclr"]
+# for task in tasks:
+#     model, linear_classifier, train_loader, test_loader = load_model_and_data(task, "cifar10")
+
+#     # evaluate_accuracy(model, linear_classifier, train_loader, test_loader)
+#     train_acc1, train_acc5 = evaluate_classifier(model, linear_classifier, train_loader)
+#     test_acc1, test_acc5 = evaluate_classifier(model, linear_classifier, test_loader)
+#     results[task]['train_acc1'] = train_acc1
+#     results[task]['train_acc5'] = train_acc5
+#     results[task]['test_acc1'] = test_acc1
+#     results[task]['test_acc5'] = test_acc5
+
+# # write the results to a file
+# with open("results.json", "w") as f:
+#     json.dump(results, f)
+
+
+"""Q3: compare the 3 pretrained self-supervised models on the CIFAR-10 (or Tiny ImageNet) test set. Usage: eval_cifar10.py [cifar10|tiny].
+"""
+import os.path as osp
+import sys
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import pandas as pd
+import torch
+import torch.utils.data as data
+
+from deepul_helper.data import get_datasets
+from deepul_helper.tasks import ContextEncoder, RotationPrediction, SimCLR
+from deepul_helper.utils import accuracy, remove_module_state_dict
+
+DATASET = sys.argv[1] if len(sys.argv) > 1 else 'cifar10'  # cifar10 | tiny
+TASKS = ['context_encoder', 'rotation', 'simclr']
+BATCH_SIZE = 128
+NUM_WORKERS = 2  # Colab T4 instances only have 2 CPU cores
+
+torch.backends.cudnn.benchmark = True
+
+
+def to_cuda(images):
+    # SimCLR returns a tuple of two views, the other tasks a single tensor
+    if isinstance(images, (tuple, list)):
+        return [x.cuda(non_blocking=True) for x in images]
+    return images.cuda(non_blocking=True)
+
+
+def load(task):
+    """Load model + its linear classifier + the test loader (no train loader needed)."""
+    _, test_dset, n_classes = get_datasets(DATASET, task)
+    test_loader = data.DataLoader(test_dset, batch_size=BATCH_SIZE, shuffle=False,
+                                  num_workers=NUM_WORKERS, pin_memory=True)
+
+    ckpt = torch.load(osp.join('results', f'{DATASET}_{task}', 'model_best.pth.tar'),
+                      map_location='cpu', weights_only=False)
+
+    if task == 'context_encoder':
+        model = ContextEncoder(DATASET, n_classes)
+    elif task == 'rotation':
+        model = RotationPrediction(DATASET, n_classes)
+    else:
+        model = SimCLR(DATASET, n_classes, None)
+    model.load_state_dict(remove_module_state_dict(ckpt['state_dict']))
+    model.cuda().eval()
+
+    classifier = model.construct_classifier()
+    classifier.load_state_dict(remove_module_state_dict(ckpt['state_dict_linear']))
+    classifier.cuda().eval()
+    return model, classifier, test_loader
+
+
+@torch.no_grad()
+def evaluate(model, classifier, loader):
+    correct1, correct5 = 0., 0.
+    for images, target in loader:
+        images, target = to_cuda(images), target.cuda(non_blocking=True)
+        with torch.autocast('cuda', dtype=torch.float16):  # fp16 on the T4 tensor cores
+            _, zs = model(images)
+            logits = classifier(zs)
+        acc1, acc5 = accuracy(logits.float(), target, topk=(1, 5))
+        correct1 += acc1.item() * target.shape[0]
+        correct5 += acc5.item() * target.shape[0]
+    n = len(loader.dataset)
+    return correct1 / n, correct5 / n
+
+
+if __name__ == '__main__':
+    rows = []
+    for task in TASKS:
+        model, classifier, test_loader = load(task)
+        top1, top5 = evaluate(model, classifier, test_loader)
+        n_params = sum(p.numel() for p in model.parameters()) / 1e6
+        rows.append(dict(Method=task, Params_M=round(n_params, 1),
+                         Top1=round(top1, 2), Top5=round(top5, 2)))
+        print(rows[-1])
+
+        # free GPU memory before loading the next model
+        del model, classifier, test_loader
+        torch.cuda.empty_cache()
+
+    df = pd.DataFrame(rows)
+    print(f'\n{DATASET} test accuracy (%)')
+    print(df.to_string(index=False))
+    df.to_csv(f'results_{DATASET}.csv', index=False)
+
+    ax = df.set_index('Method')[['Top1', 'Top5']].plot.bar(rot=0, figsize=(7, 4))
+    ax.set_ylabel('Test accuracy (%)')
+    ax.set_title(f'Linear classification on {DATASET}')
+    plt.tight_layout()
+    plt.savefig(f'results_{DATASET}.png', dpi=150)
