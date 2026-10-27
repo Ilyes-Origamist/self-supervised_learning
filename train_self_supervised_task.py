@@ -21,7 +21,7 @@ from deepul_helper.lars import LARS
 parser = argparse.ArgumentParser()
 parser.add_argument('-d', '--dataset', type=str, default='cifar10', help='cifar10|imagenet* (default: cifar10)')
 parser.add_argument('-t', '--task', type=str, default='rotation',
-                    help='context_encoder|rotation|cpc|simclr (default: rotation)')
+                    help='context_encoder|rotation|cpc|simclr|spatial_context (default: rotation)')
 
 # Training parameters
 parser.add_argument('-b', '--batch_size', type=int, default=128, help='batch size total for all gpus (default: 128)')
@@ -44,7 +44,7 @@ best_acc = 0.0
 
 def main():
     args = parser.parse_args()
-    assert args.task in ['context_encoder', 'rotation', 'cpc', 'simclr']
+    assert args.task in ['context_encoder', 'rotation', 'cpc', 'simclr', 'spatial_context']
 
     args.output_dir = osp.join('results', f"{args.dataset}_{args.task}")
     if not osp.exists(args.output_dir):
@@ -58,21 +58,26 @@ def main_worker(gpu, ngpus, args):
     global best_loss
 
     print(f'Starting process on GPU: {gpu}')
-    dist.init_process_group(backend='nccl', init_method=f'tcp://localhost:{args.port}',
+    backend = 'nccl' if dist.is_nccl_available() else 'gloo'  # NCCL is Linux-only
+    if os.name == 'nt':
+        os.environ.setdefault('USE_LIBUV', '0')  # Windows PyTorch builds lack libuv for the TCP store
+    dist.init_process_group(backend=backend, init_method=f'tcp://localhost:{args.port}',
                             world_size=ngpus, rank=gpu)
     total_batch_size = args.batch_size
     args.batch_size = args.batch_size // ngpus
 
     train_dataset, val_dataset, n_classes = get_datasets(args.dataset, args.task)
+    # Windows spawns workers, copying the dataset (~0.7 GB for tiny) into each one
+    num_workers = min(4 if os.name == 'nt' else 16, os.cpu_count())
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, num_workers=min(16, os.cpu_count()), persistent_workers=True,
+        train_dataset, batch_size=args.batch_size, num_workers=num_workers, persistent_workers=True,
         pin_memory=True, sampler=train_sampler, drop_last=True
     )
 
     val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset)
     val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=args.batch_size, num_workers=min(16, os.cpu_count()), persistent_workers=True,
+        val_dataset, batch_size=args.batch_size, num_workers=num_workers, persistent_workers=True,
         pin_memory=True, drop_last=True, sampler=val_sampler
     )
 
@@ -84,6 +89,8 @@ def main_worker(gpu, ngpus, args):
         model = CPC(args.dataset, n_classes)
     elif args.task == 'simclr':
         model = SimCLR(args.dataset, n_classes, dist)
+    elif args.task == 'spatial_context':
+        model = SpatialContext(args.dataset, n_classes)
     else:
         raise Exception('Invalid task:', args.task)
     args.metrics = model.metrics
@@ -96,8 +103,13 @@ def main_worker(gpu, ngpus, args):
     args.gpu = gpu
 
     linear_classifier = model.construct_classifier().cuda(gpu)
-    linear_classifier = torch.nn.parallel.DistributedDataParallel(linear_classifier, device_ids=[gpu], find_unused_parameters=True)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu], find_unused_parameters=True)
+    if backend == 'gloo' and ngpus == 1:
+        # Gloo crashes when all-reducing CUDA tensors on Windows, and one GPU has nothing to sync
+        linear_classifier = SingleProcessWrapper(linear_classifier)
+        model = SingleProcessWrapper(model)
+    else:
+        linear_classifier = torch.nn.parallel.DistributedDataParallel(linear_classifier, device_ids=[gpu], find_unused_parameters=True)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu], find_unused_parameters=True)
 
     if args.optimizer == 'sgd':
         optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum,
@@ -292,6 +304,17 @@ def validate(val_loader, model, linear_classifier, args, dist):
 
     dist.barrier()
     return data[0], data[1]
+
+
+class SingleProcessWrapper(nn.Module):
+    """Stand-in for DistributedDataParallel with a single process: no collectives,
+    same 'module.' prefix in the state_dict, so checkpoints stay compatible"""
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
 
 
 def save_checkpoint(state, is_best, args, filename='checkpoint.pth.tar'):

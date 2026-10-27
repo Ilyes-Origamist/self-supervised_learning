@@ -101,6 +101,22 @@ def get_transform(dataset, task, train=True):
                 transforms.ToTensor(),
                 transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
             ])
+    elif task == 'spatial_context':
+        # Support to CIFAR10 and TinyImageNet datasets only for now
+        # No image-level augmentation, as in the paper (Sec. 3.1): the per-patch jitter and the colour
+        # dropping (done on the patches, in SpatialContext) are the only perturbations.
+        # A zero-padded RandomCrop (as for rotation) would even leave black bands on the image edges,
+        # revealing the position of the border patches (trivial shortcut).
+        # TwoResTransform returns two views of the same image:
+        #   - 64x64 for the patches   (CIFAR10: upsampled 32 -> 64, like the context encoder; tiny: native)
+        #   - 32x32 for the linear probe (CIFAR10: native; tiny: downsampled 64 -> 32, as for the other tasks)
+        if dataset == 'cifar10':
+            normalize = transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))
+        elif dataset == 'tiny':
+            normalize = transforms.Normalize((0.4802, 0.4481, 0.3975), (0.2770, 0.2691, 0.2821))
+        else:
+            raise Exception('Unsupported dataset for spatial_context:', dataset)
+        transform = TwoResTransform(transforms.Compose([]), normalize)
     elif task == 'simclr':
         if dataset == 'cifar10':
             if train:
@@ -247,6 +263,18 @@ class SimCLRDataTransform(object):
         xi = self.transform(sample)
         xj = self.transform(sample)
         return xi, xj
+
+
+class TwoResTransform(object):
+    """Returns a 64x64 and a 32x32 view of the same augmented image (spatial context task)"""
+    def __init__(self, transform, normalize, sizes=(64, 32)):
+        self.transform = transform
+        self.normalize = normalize
+        self.sizes = sizes
+
+    def __call__(self, sample):
+        sample = self.transform(sample)
+        return tuple(self.normalize(F.to_tensor(F.resize(sample, s))) for s in self.sizes)
 
 # Re-written torchvision transforms to support operations on multiple inputs
 # Needed to maintain consistency on random transforms with real images and their segmentations

@@ -1,27 +1,4 @@
 
-# from deepul_helper.demos import evaluate_classifier, load_model_and_data, evaluate_accuracy, display_nearest_neighbors, show_context_encoder_inpainting 
-# import json
-
-# results = {'context_encoder': {}, 'rotation': {}, 'simclr': {}}
-
-# # TASK : Evaluate different pretrained self-supervised models with different pretext-tasks on CIFAR-10
-# tasks = ["context_encoder", "rotation", "simclr"]
-# for task in tasks:
-#     model, linear_classifier, train_loader, test_loader = load_model_and_data(task, "cifar10")
-
-#     # evaluate_accuracy(model, linear_classifier, train_loader, test_loader)
-#     train_acc1, train_acc5 = evaluate_classifier(model, linear_classifier, train_loader)
-#     test_acc1, test_acc5 = evaluate_classifier(model, linear_classifier, test_loader)
-#     results[task]['train_acc1'] = train_acc1
-#     results[task]['train_acc5'] = train_acc5
-#     results[task]['test_acc1'] = test_acc1
-#     results[task]['test_acc5'] = test_acc5
-
-# # write the results to a file
-# with open("results.json", "w") as f:
-#     json.dump(results, f)
-
-
 """Q3: compare the 3 pretrained self-supervised models on the CIFAR-10 (or Tiny ImageNet) test set. Usage: eval_cifar10.py [cifar10|tiny].
 """
 import os.path as osp
@@ -35,11 +12,11 @@ import torch
 import torch.utils.data as data
 
 from deepul_helper.data import get_datasets
-from deepul_helper.tasks import ContextEncoder, RotationPrediction, SimCLR
+from deepul_helper.tasks import ContextEncoder, RotationPrediction, SimCLR, SpatialContext
 from deepul_helper.utils import accuracy, remove_module_state_dict
 
 DATASET = sys.argv[1] if len(sys.argv) > 1 else 'cifar10'  # cifar10 | tiny
-TASKS = ['context_encoder', 'rotation', 'simclr']
+TASKS = ['context_encoder', 'rotation', 'simclr', 'spatial_context']
 BATCH_SIZE = 128
 NUM_WORKERS = 2  # Colab T4 instances only have 2 CPU cores
 
@@ -66,6 +43,8 @@ def load(task):
         model = ContextEncoder(DATASET, n_classes)
     elif task == 'rotation':
         model = RotationPrediction(DATASET, n_classes)
+    elif task == 'spatial_context':
+        model = SpatialContext(DATASET, n_classes)
     else:
         model = SimCLR(DATASET, n_classes, None)
     model.load_state_dict(remove_module_state_dict(ckpt['state_dict']))
