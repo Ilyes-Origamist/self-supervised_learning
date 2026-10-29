@@ -7,9 +7,11 @@ of full images, for several trunks, layers and input resolutions:
     patch-bn : checkpoint, BatchNorm statistics from patches (= the online probe's condition)
     image-bn : checkpoint, BatchNorm statistics recomputed on full images at the probe resolution
   layers: conv2 (rotation's probe layer), conv3, conv4 (what the pretext head reads)
-  resolutions: 32 (the 32x32 view the probe uses) or 64 (the 64x64 view the patches are cut from,
-               i.e. the scale the trunk was trained at); feature maps are average-pooled to 8x8,
-               so the probe always reads 192 x 8 x 8 = 12288 features.
+  resolutions: 32 (the 32x32 view the online probe uses) or the size of the view the patches are cut
+               from (64 for cifar10/tiny, 96 for stl10, 128 for imagenette: the scale the trunk was
+               trained at); feature maps are average-pooled to 8x8, so the probe always reads
+               192 x 8 x 8 = 12288 features.
+  Unlabelled training images (STL-10, label -1) are skipped: the probe trains on the 5k labelled ones.
 First run (tiny, conv2, 32x32): random 10.8%, patch-bn 4.6%, image-bn 4.5% test top-1
 -> not a BatchNorm issue; this sweep tests the layer and the scale.
 
@@ -29,18 +31,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim.lr_scheduler as lr_scheduler
 
-from deepul_helper.data import get_datasets
+from deepul_helper.data import SPATIAL_CONTEXT, get_datasets
 from deepul_helper.tasks import SpatialContext
 from deepul_helper.utils import accuracy, remove_module_state_dict
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-d', '--dataset', type=str, default='tiny', help='tiny|cifar10 (default: tiny)')
+parser.add_argument('-d', '--dataset', type=str, default='tiny',
+                    help='tiny|cifar10|stl10|imagenette (default: tiny)')
 parser.add_argument('-c', '--ckpt', type=str, default=None,
                     help='default: results/<dataset>_spatial_context/checkpoint.pth.tar')
 parser.add_argument('-v', '--variants', type=str, default='random,image-bn',
                     help='comma-separated subset of random,patch-bn,image-bn (default: random,image-bn)')
 parser.add_argument('-l', '--layers', type=str, default='conv2,conv3,conv4', help='default: conv2,conv3,conv4')
-parser.add_argument('-r', '--resolutions', type=str, default='32,64', help='default: 32,64')
+parser.add_argument('-r', '--resolutions', type=str, default=None,
+                    help='default: 32 and the patch view size (32,64 for tiny/cifar10, 32,96 stl10, 32,128 imagenette)')
 parser.add_argument('-e', '--epochs', type=int, default=5, help='probe epochs per configuration (default: 5)')
 parser.add_argument('-b', '--batch_size', type=int, default=256, help='default: 256')
 parser.add_argument('--lr', type=float, default=0.01,
@@ -52,19 +56,24 @@ torch.backends.cudnn.benchmark = True
 FEAT_SIZE = 8  # feature maps are pooled to 8x8, the conv2 size of a 32x32 image
 
 
-def load_split(dset, name, resolutions):
-    """Apply the task's transform once (same preprocessing as training) and keep the requested views"""
-    views = {64: 0, 32: 1}  # TwoResTransform returns (64x64 view, 32x32 view)
+def load_split(dset, name, resolutions, patch_view):
+    """Apply the task's transform once (same preprocessing as training) and keep the requested views
+    of the labelled images (STL-10's unlabelled training images, label -1, are skipped)"""
+    views = {patch_view: 0, 32: 1}  # TwoResTransform returns (patch view, 32x32 view)
+    labels = getattr(dset, 'y', None)  # known in advance for MemmapImages / ArrayImages
+    indices = range(len(dset)) if labels is None else [i for i in range(len(dset)) if labels[i] >= 0]
     xs = {r: [] for r in resolutions}
     ys = []
     start = time.time()
-    for i in range(len(dset)):
+    for n, i in enumerate(indices):
         imgs, y = dset[i]
+        if y < 0:
+            continue
         for r in resolutions:
             xs[r].append(imgs[views[r]].half())
         ys.append(y)
-        if (i + 1) % 10000 == 0:
-            print(f'  {name}: {i + 1}/{len(dset)} images ({time.time() - start:.0f}s)', flush=True)
+        if (n + 1) % 10000 == 0:
+            print(f'  {name}: {n + 1}/{len(indices)} images ({time.time() - start:.0f}s)', flush=True)
     return {r: torch.stack(xs[r]) for r in resolutions}, torch.tensor(ys)
 
 
@@ -167,10 +176,11 @@ if __name__ == '__main__':
     args = parser.parse_args()
     variants = args.variants.split(',')
     layers = args.layers.split(',')
-    resolutions = [int(r) for r in args.resolutions.split(',')]
+    patch_view = SPATIAL_CONTEXT[args.dataset]['size']
+    resolutions = [32, patch_view] if args.resolutions is None else [int(r) for r in args.resolutions.split(',')]
     assert all(v in ('random', 'patch-bn', 'image-bn') for v in variants), variants
     assert all(l in ('conv1', 'conv2', 'conv3', 'conv4') for l in layers), layers
-    assert all(r in (32, 64) for r in resolutions), resolutions
+    assert all(r in (32, patch_view) for r in resolutions), f'{resolutions}: use 32 and/or {patch_view}'
 
     if args.ckpt is None:
         args.ckpt = osp.join('results', f'{args.dataset}_spatial_context', 'checkpoint.pth.tar')
@@ -185,9 +195,9 @@ if __name__ == '__main__':
 
     print('Preparing the probe views...', flush=True)
     train_dset, test_dset, n_classes = get_datasets(args.dataset, 'spatial_context')
-    xtr, ytr = load_split(train_dset, 'train', resolutions)
-    xte, yte = load_split(test_dset, 'test', resolutions)
-    print(f'train {len(ytr)}, test {len(yte)} images, {n_classes} classes, '
+    xtr, ytr = load_split(train_dset, 'train', resolutions, patch_view)
+    xte, yte = load_split(test_dset, 'test', resolutions, patch_view)
+    print(f'train {len(ytr)} labelled, test {len(yte)} images, {n_classes} classes, '
           f'chance {100. / n_classes:.2f}%', flush=True)
 
     rows = []

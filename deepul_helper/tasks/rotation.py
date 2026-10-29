@@ -11,7 +11,7 @@ class RotationPrediction(nn.Module):
 
     def __init__(self, dataset, n_classes):
         super().__init__()
-        if dataset in ('cifar10', 'tiny'):
+        if dataset in ('cifar10', 'tiny', 'stl10'):  # tiny and stl10 downsampled to 32x32
             self.model = NetworkInNetwork()
             self.latent_dim = 192 * 8 * 8
             self.feat_layer = 'conv2'
@@ -25,7 +25,7 @@ class RotationPrediction(nn.Module):
         self.n_classes = n_classes
 
     def construct_classifier(self):
-        if self.dataset in ('cifar10', 'tiny'):
+        if self.dataset in ('cifar10', 'tiny', 'stl10'):
             classifier = nn.Sequential(
                 nn.BatchNorm1d(self.latent_dim, affine=False),
                 nn.Linear(self.latent_dim, self.n_classes)
@@ -54,7 +54,7 @@ class RotationPrediction(nn.Module):
         acc = correct / targets.shape[0] * 100.
 
         zs = zs[:batch_size]
-        if self.dataset in ('cifar10', 'tiny'):
+        if self.dataset in ('cifar10', 'tiny', 'stl10'):
             zs = zs.flatten(start_dim=1)
 
         return dict(Loss=loss, Acc1=acc), zs[:batch_size]

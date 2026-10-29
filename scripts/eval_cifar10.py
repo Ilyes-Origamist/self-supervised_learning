@@ -74,6 +74,10 @@ def evaluate(model, classifier, loader):
 if __name__ == '__main__':
     rows = []
     for task in TASKS:
+        # if no model for the task for the dataset, skip it
+        if not osp.exists(osp.join('results', f'{DATASET}_{task}', 'model_best.pth.tar')):
+            print(f'No model for {task} on {DATASET}, skipping.')
+            continue
         model, classifier, test_loader = load(task)
         top1, top5 = evaluate(model, classifier, test_loader)
         n_params = sum(p.numel() for p in model.parameters()) / 1e6

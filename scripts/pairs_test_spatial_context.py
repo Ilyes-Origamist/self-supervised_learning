@@ -20,13 +20,13 @@ import os.path as osp
 
 import torch
 
-from deepul_helper.data import get_datasets
+from deepul_helper.data import SPATIAL_CONTEXT, get_datasets
 from deepul_helper.tasks import SpatialContext
 from deepul_helper.utils import remove_module_state_dict
 from probe_spatial_context import load_split, batches
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-d', '--dataset', type=str, default='tiny', help='tiny|cifar10 (default: tiny)')
+parser.add_argument('-d', '--dataset', type=str, default='tiny', help='tiny|cifar10|stl10|imagenette (default: tiny)')
 parser.add_argument('-c', '--ckpt', type=str, default=None,
                     help='default: results/<dataset>_spatial_context/checkpoint.pth.tar')
 parser.add_argument('-n', '--repeats', type=int, default=3,
@@ -83,9 +83,10 @@ if __name__ == '__main__':
         raise SystemExit(f'No checkpoint at {args.ckpt}. Train spatial_context on {args.dataset} first '
                          f'or pass one with -c.')
 
-    print('Preparing the 64x64 test views...', flush=True)
+    size = SPATIAL_CONTEXT[args.dataset]['size']  # the view the patches are cut from
+    print(f'Preparing the {size}x{size} test views...', flush=True)
     _, test_dset, n_classes = get_datasets(args.dataset, 'spatial_context')
-    xte, yte = load_split(test_dset, 'test', [64])
+    xte, yte = load_split(test_dset, 'test', [size], size)
 
     ckpt = torch.load(args.ckpt, map_location='cpu', weights_only=False)
     model = SpatialContext(args.dataset, n_classes)
@@ -94,9 +95,9 @@ if __name__ == '__main__':
     print(f'Checkpoint {args.ckpt}: epoch {ckpt["epoch"]} | patch {model.patch_size}, gap {model.gap}, '
           f'jitter {model.jitter}, colour mode {model.color_mode}', flush=True)
 
-    acc, max_diff, total = run(model, xte[64], yte, args)
+    acc, max_diff, total = run(model, xte[size], yte, args)
     print(f'\nSiamese check: one batch through the shared trunk vs two separate branches, '
-          f'max |logit difference| = {max_diff:.2e} (should be ~1e-5 or less)')
+          f'max |logit difference| = {max_diff:.2e} (float32 rounding, e.g. ~1e-4, is fine)')
     print(f'\nPretext accuracy on {total} test pairs ({args.dataset}, chance 12.50%)')
     for name in ('normal', 'swap-first', 'swap-second'):
         print(f'  {name:<12} {acc[name]:6.2f}%')

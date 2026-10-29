@@ -19,7 +19,7 @@ from deepul_helper.lars import LARS
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-d', '--dataset', type=str, default='cifar10', help='cifar10|imagenet* (default: cifar10)')
+parser.add_argument('-d', '--dataset', type=str, default='cifar10', help='cifar10|tiny|imagenet* (+ stl10 for rotation|spatial_context, imagenette for spatial_context) (default: cifar10)')
 parser.add_argument('-t', '--task', type=str, default='rotation',
                     help='context_encoder|rotation|cpc|simclr|spatial_context (default: rotation)')
 
@@ -45,6 +45,8 @@ best_acc = 0.0
 def main():
     args = parser.parse_args()
     assert args.task in ['context_encoder', 'rotation', 'cpc', 'simclr', 'spatial_context']
+    assert args.dataset != 'stl10' or args.task in ('rotation', 'spatial_context'), \
+        'stl10 is only supported by the rotation and spatial_context tasks'
 
     args.output_dir = osp.join('results', f"{args.dataset}_{args.task}")
     if not osp.exists(args.output_dir):
@@ -206,7 +208,8 @@ def train(train_loader, model, linear_classifier, optimizer,
 
         # compute loss
         if isinstance(images, (tuple, list)):
-            # Special case for SimCLR which returns a tuple of 2 image batches
+            # Special case for SimCLR (2 augmented views) and spatial_context
+            # (pretext view + 32x32 probe view), which return a tuple of 2 image batches
             bs = images[0].shape[0]
             images = [x.cuda(args.gpu, non_blocking=True)
                       for x in images]
@@ -226,11 +229,16 @@ def train(train_loader, model, linear_classifier, optimizer,
 
         # compute gradient and optimizer step for classifier
         logits = linear_classifier(zs)
-        loss = F.cross_entropy(logits, target)
-
-        acc1, acc5 = accuracy(logits, target, topk=(1, 5))
-        top1.update(acc1[0], bs)
-        top5.update(acc5[0], bs)
+        # unlabelled images (label -1, STL-10) only train the pretext task, not the probe
+        labelled = target >= 0
+        n_labelled = int(labelled.sum())
+        if n_labelled > 0:
+            loss = F.cross_entropy(logits[labelled], target[labelled])
+            acc1, acc5 = accuracy(logits[labelled], target[labelled], topk=(1, 5))
+            top1.update(acc1[0], n_labelled)
+            top5.update(acc5[0], n_labelled)
+        else:
+            loss = logits.sum() * 0.  # keeps the backward pass (and DDP's gradient sync) uniform
 
         optimizer_linear.zero_grad()
         loss.backward()
@@ -266,7 +274,7 @@ def validate(val_loader, model, linear_classifier, args, dist):
         for i, (images, target) in enumerate(val_loader):
             # compute and measure loss
             if isinstance(images, (tuple, list)):
-                # Special case for SimCLR which returns a tuple of 2 image batches
+                # Special case for SimCLR and spatial_context (tuple of 2 image batches)
                 bs = images[0].shape[0]
                 images = [x.cuda(args.gpu, non_blocking=True)
                         for x in images]

@@ -24,9 +24,46 @@ class ArrayImages(Dataset):
 
     def __getitem__(self, i):
         return self.transform(Image.fromarray(self.x[i])), int(self.y[i])
-    
+
+
+class MemmapImages(Dataset):
+    """Images stored in an .npy file (N, H, W, C uint8), memory-mapped lazily in each process.
+    DataLoader workers on Windows receive a pickled copy of the dataset: only the path is copied."""
+    def __init__(self, x_path, y, transform):
+        self.x_path, self.y, self.transform = x_path, y, transform
+        self.x = None
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['x'] = None  # never pickle the mapped array
+        return state
+
+    def __getitem__(self, i):
+        if self.x is None:
+            self.x = np.load(self.x_path, mmap_mode='r')
+        return self.transform(Image.fromarray(np.asarray(self.x[i]))), int(self.y[i])
+
+
+# Spatial context task: size of the view the patches are cut from, and normalisation statistics.
+# The linear probe always sees a 32x32 view, as for the other tasks.
+# stl10 and imagenette (higher resolution) are only supported by the spatial context task for now
+# (+ the rotation task for stl10, downsampled to 32x32 as for tiny).
+SPATIAL_CONTEXT = {
+    'cifar10':    dict(size=64,  mean=(0.4914, 0.4822, 0.4465), std=(0.247, 0.243, 0.261)),     # upsampled 32 -> 64
+    'tiny':       dict(size=64,  mean=(0.4802, 0.4481, 0.3975), std=(0.2770, 0.2691, 0.2821)),  # native 64
+    'stl10':      dict(size=96,  mean=(0.4467, 0.4398, 0.4066), std=(0.2603, 0.2566, 0.2713)),  # native 96
+    'imagenette': dict(size=128, mean=(0.485, 0.456, 0.406),    std=(0.229, 0.224, 0.225)),     # 160px version, centre 128
+}
+STL10_TRAIN_SIZE = 50000  # 5k labelled + 45k unlabelled images, same size as the other training sets
+
+STL10_HF_REPO = 'jxie/stl10'  # the Hugging Face repo that worked for you
+
+
 def get_transform(dataset, task, train=True):
-    pre = [transforms.Resize(32)] if dataset == 'tiny' else []
+    pre = [transforms.Resize(32)] if dataset in ('tiny', 'stl10') else []
     transform = None
     if task == 'context_encoder':
         if dataset == 'cifar10':
@@ -84,6 +121,20 @@ def get_transform(dataset, task, train=True):
                     transforms.ToTensor(),
                     transforms.Normalize((0.4802, 0.4481, 0.3975), (0.2770, 0.2691, 0.2821))
                 ])
+        elif dataset == 'stl10':
+            # 96x96 downsampled to 32x32, as for tiny (the 96x96 pretext is too slow: ~17 h on Colab)
+            if train:
+                transform = transforms.Compose(pre + [
+                    transforms.RandomCrop(32, padding=4),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.4467, 0.4398, 0.4066), (0.2603, 0.2566, 0.2713))
+                ])
+            else:
+                transform = transforms.Compose(pre + [
+                    transforms.ToTensor(),
+                    transforms.Normalize((0.4467, 0.4398, 0.4066), (0.2603, 0.2566, 0.2713))
+                ])
     elif task == 'cpc':
         if train:
             transform = transforms.Compose([
@@ -102,21 +153,22 @@ def get_transform(dataset, task, train=True):
                 transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
             ])
     elif task == 'spatial_context':
-        # Support to CIFAR10 and TinyImageNet datasets only for now
+        # Supports the datasets of SPATIAL_CONTEXT (cifar10, tiny, stl10, imagenette)
         # No image-level augmentation, as in the paper (Sec. 3.1): the per-patch jitter and the colour
         # dropping (done on the patches, in SpatialContext) are the only perturbations.
         # A zero-padded RandomCrop (as for rotation) would even leave black bands on the image edges,
         # revealing the position of the border patches (trivial shortcut).
         # TwoResTransform returns two views of the same image:
-        #   - 64x64 for the patches   (CIFAR10: upsampled 32 -> 64, like the context encoder; tiny: native)
-        #   - 32x32 for the linear probe (CIFAR10: native; tiny: downsampled 64 -> 32, as for the other tasks)
-        if dataset == 'cifar10':
-            normalize = transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))
-        elif dataset == 'tiny':
-            normalize = transforms.Normalize((0.4802, 0.4481, 0.3975), (0.2770, 0.2691, 0.2821))
-        else:
+        #   - size x size for the patches (64 for CIFAR10: upsampled 32 -> 64, like the context encoder;
+        #     64 for tiny, 96 for stl10, 128 for imagenette: native resolution)
+        #   - 32x32 for the linear probe, as for the other tasks
+        if dataset not in SPATIAL_CONTEXT:
             raise Exception('Unsupported dataset for spatial_context:', dataset)
-        transform = TwoResTransform(transforms.Compose([]), normalize)
+        cfg = SPATIAL_CONTEXT[dataset]
+        normalize = transforms.Normalize(cfg['mean'], cfg['std'])
+        # Imagenette images are not square: keep the central square (no augmentation)
+        pre = [transforms.Resize(cfg['size']), transforms.CenterCrop(cfg['size'])] if dataset == 'imagenette' else []
+        transform = TwoResTransform(transforms.Compose(pre), normalize, sizes=(cfg['size'], 32))
     elif task == 'simclr':
         if dataset == 'cifar10':
             if train:
@@ -193,7 +245,30 @@ def get_transform(dataset, task, train=True):
 
 
 def get_datasets(dataset, task):
-    if 'imagenet' in dataset:
+    # before the 'imagenet' branch: 'imagenet' in 'imagenette' is True
+    if dataset == 'stl10' and task not in ('spatial_context', 'rotation'):
+        raise Exception('stl10 is only supported by the spatial_context and rotation tasks for now')
+    if dataset == 'imagenette' and task != 'spatial_context':
+        raise Exception('imagenette is only supported by the spatial_context task for now')
+    if dataset == 'stl10':
+        # Built once by the notebook cell: train = 5k labelled + 45k unlabelled (label -1, pretext only)
+        root = osp.join('data', 'stl10')
+        p = lambda name: osp.join(root, f'{name}.npy')
+        if not osp.exists(p('train_x')):
+            raise Exception(f'{p("train_x")} not found: run the one-off STL-10 cell first')
+        train_dset = MemmapImages(p('train_x'), np.load(p('train_y')), get_transform(dataset, task, train=True))
+        test_dset = MemmapImages(p('test_x'), np.load(p('test_y')), get_transform(dataset, task, train=False))
+        return train_dset, test_dset, 10
+    elif dataset == 'imagenette':
+        # 160px version (~9.5k train / 3.9k val images, 10 classes), downloaded once (~95 MB)
+        root = osp.join('data', 'imagenette')
+        download = not osp.isdir(osp.join(root, 'imagenette2-160'))
+        train_dset = datasets.Imagenette(root, split='train', size='160px', download=download,
+                                         transform=get_transform(dataset, task, train=True))
+        test_dset = datasets.Imagenette(root, split='val', size='160px',
+                                        transform=get_transform(dataset, task, train=False))
+        return train_dset, test_dset, 10
+    elif 'imagenet' in dataset:
         train_dir = osp.join('data', dataset, 'train')
         val_dir = osp.join('data', dataset, 'val')
         train_dataset = datasets.ImageFolder(

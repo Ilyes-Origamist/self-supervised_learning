@@ -2,14 +2,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from deepul_helper.data import SPATIAL_CONTEXT
 from .rotation import NetworkInNetwork
+
+# (patch size, gap, jitter) for each size of the view the patches are cut from: the patch is ~17% of
+# the image side (paper: 96 px on ~390-670 px images, i.e. 14-25%), the gap ~half a patch (as in the
+# paper), the jitter ~7-9% of the patch (paper: 7/96)
+PATCH_GEOMETRY = {64: (11, 5, 1), 96: (16, 8, 1), 128: (22, 11, 2)}
 
 """
 Implements the spatial context task from the paper https://arxiv.org/pdf/1505.05192.pdf
 But uses a different architecture (Network in Network, same trunk as RotationPrediction)
-instead of AlexNet, scaled down to 64x64 images:
-    11x11 patches (17% of the image side; paper: 96 px on ~390-670 px images, i.e. 14-25%),
-    gap of 5 (~half a patch, as in the paper), jitter of +-1 per patch.
+instead of AlexNet, scaled down to small images (data.SPATIAL_CONTEXT gives the size per dataset):
+    64x64 (cifar10, tiny): 11x11 patches, gap of 5, jitter of +-1 per patch
+    96x96 (stl10):         16x16 patches, gap of 8, jitter of +-1
+    128x128 (imagenette):  22x22 patches, gap of 11, jitter of +-2
     As in the paper (Sec. 3), the first patch is sampled anywhere in the image, not always at the centre:
     with a fixed centre anchor, the label is the second patch's absolute position, a trivial shortcut
     (position alone gives 100% accuracy; 27% here, chance 12.5%).
@@ -30,13 +37,13 @@ class SpatialContext(nn.Module):
 
     def __init__(self, dataset, n_classes):
         super().__init__()
-        self.patch_size = 11 # 11x11 patches on a 64x64 image
-        self.gap = 5 # around half the patch size, as in the paper
-        self.jitter = 1 # jitter of +-1 pixel per patch (keeps the gap between 3 and 7 pixels)
         self.color_mode = 'drop' # 'drop' | 'project' | None, against chromatic aberration (paper, Sec. 3.1)
         assert self.color_mode in ('drop', 'project', None), self.color_mode
-        if dataset in ('cifar10', 'tiny'):
-            self.model = NetworkInNetwork()  # fully convolutional: 11x11 patch -> conv4 192x3x3
+        if dataset in SPATIAL_CONTEXT:
+            self.image_size = SPATIAL_CONTEXT[dataset]['size']
+            # e.g. 64x64 view: 11x11 patches, gap of 5 (patches 3 to 7 pixels apart with the jitter of +-1)
+            self.patch_size, self.gap, self.jitter = PATCH_GEOMETRY[self.image_size]
+            self.model = NetworkInNetwork()  # fully convolutional, e.g. 11x11 patch -> conv4 192x3x3
             # NiN's own classifier block (GAP -> 4 rotation classes) is never used: the 8 positions
             # depend on both patches, so they are predicted by the fused head below
             self.model._feature_blocks[-1] = nn.Identity()
@@ -60,10 +67,9 @@ class SpatialContext(nn.Module):
 
         # Colour projection on normalised images: undo the per-channel std of data.py's Normalize
         # (the mean is already subtracted), project, redo it: x' = diag(1/std) B diag(std) x
-        std = {'cifar10': (0.247, 0.243, 0.261), 'tiny': (0.2770, 0.2691, 0.2821)}[dataset]
         a = torch.tensor([[-1., 2., -1.]])
         B = torch.eye(3) - a.t() @ a / (a @ a.t())
-        std = torch.tensor(std)
+        std = torch.tensor(SPATIAL_CONTEXT[dataset]['std'])
         # not persistent: derived from constants, keeps checkpoints compatible across colour modes
         self.register_buffer('color_projection', B * std[None, :] / std[:, None], persistent=False)
 
@@ -74,7 +80,7 @@ class SpatialContext(nn.Module):
         )
 
     def forward(self, images):
-        # 64x64 view for the patches, 32x32 view of the same image for the linear probe
+        # size x size view for the patches (64, 96 or 128), 32x32 view of the same image for the linear probe
         images, images_probe = images
         batch_size = images.shape[0]
         patches1, patches2, targets = self._get_patches(images)
@@ -110,9 +116,9 @@ class SpatialContext(nn.Module):
 
     def _get_patches(self, images):
         batch_size, dev = images.shape[0], images.device
-        P, J = self.patch_size, self.jitter # 11, 1
-        size = images.shape[-1]  # 64
-        stride = P + self.gap    # 16: offset between the two patches along each axis
+        P, J = self.patch_size, self.jitter  # e.g. 11, 1 on a 64x64 view
+        size = images.shape[-1]  # self.image_size: 64, 96 or 128
+        stride = P + self.gap    # e.g. 16 on a 64x64 view: offset between the two patches along each axis
         # steps (dy, dx) for labels 0..7 = paper's positions 1..8
         steps = torch.tensor([(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)],
                              device=dev)
