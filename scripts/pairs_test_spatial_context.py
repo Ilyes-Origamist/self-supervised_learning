@@ -20,6 +20,10 @@ import os.path as osp
 
 import torch
 
+import sys
+# repository root, so that deepul_helper is found without `pip install -e .`
+sys.path.insert(0, osp.dirname(osp.dirname(osp.abspath(__file__))))
+
 from deepul_helper.data import SPATIAL_CONTEXT, get_datasets
 from deepul_helper.tasks import SpatialContext
 from deepul_helper.utils import remove_module_state_dict

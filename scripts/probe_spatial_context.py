@@ -12,6 +12,13 @@ of full images, for several trunks, layers and input resolutions:
                trained at); feature maps are average-pooled to 8x8, so the probe always reads
                192 x 8 x 8 = 12288 features.
   Unlabelled training images (STL-10, label -1) are skipped: the probe trains on the 5k labelled ones.
+  trunk (--trunk): spatial_context (default), or rotation as a POSITIVE CONTROL of this evaluation code:
+    RotationPrediction uses the same NiN trunk, so its trunk (without its 4-class classifier) is loaded
+    into SpatialContext and probed by exactly the same code (encode, BatchNorm handling, probe). If the
+    rotation trunk comes out far above random here (close to its online probe), this evaluation path is
+    correct, and spatial context's low numbers come from the features it learns.
+    With --trunk rotation, 'patch-bn' means the checkpoint's own BatchNorm statistics (rotation is
+    trained on full 32x32 images), and colour projection is never applied.
 First run (tiny, conv2, 32x32): random 10.8%, patch-bn 4.6%, image-bn 4.5% test top-1
 -> not a BatchNorm issue; this sweep tests the layer and the scale.
 
@@ -19,6 +26,8 @@ Usage (from cs294-158-ssl/, with no training running on the GPU):
     python probe_spatial_context.py -d tiny
     python probe_spatial_context.py -d cifar10 -c results/tiny_spatial_context/checkpoint.pth.tar
       (CIFAR-10 probe of the trunk trained on Tiny ImageNet, until a CIFAR-10 checkpoint exists)
+    python scripts/probe_spatial_context.py -d stl10 --trunk rotation -v random,patch-bn,image-bn -l conv2 -r 32
+      (positive control: reads results/stl10_rotation/checkpoint.pth.tar)
 Read-only: loads the checkpoint and the dataset, writes nothing.
 Needs about 3 GB of RAM for tiny at both resolutions (use -r 32 to reduce it).
 """
@@ -31,6 +40,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim.lr_scheduler as lr_scheduler
 
+import sys
+# repository root, so that deepul_helper is found without `pip install -e .`
+sys.path.insert(0, osp.dirname(osp.dirname(osp.abspath(__file__))))
+
 from deepul_helper.data import SPATIAL_CONTEXT, get_datasets
 from deepul_helper.tasks import SpatialContext
 from deepul_helper.utils import accuracy, remove_module_state_dict
@@ -38,8 +51,10 @@ from deepul_helper.utils import accuracy, remove_module_state_dict
 parser = argparse.ArgumentParser()
 parser.add_argument('-d', '--dataset', type=str, default='tiny',
                     help='tiny|cifar10|stl10|imagenette (default: tiny)')
+parser.add_argument('-t', '--trunk', type=str, default='spatial_context', choices=('spatial_context', 'rotation'),
+                    help='task the checkpoint was trained with; rotation = positive control (default: spatial_context)')
 parser.add_argument('-c', '--ckpt', type=str, default=None,
-                    help='default: results/<dataset>_spatial_context/checkpoint.pth.tar')
+                    help='default: results/<dataset>_<trunk>/checkpoint.pth.tar')
 parser.add_argument('-v', '--variants', type=str, default='random,image-bn',
                     help='comma-separated subset of random,patch-bn,image-bn (default: random,image-bn)')
 parser.add_argument('-l', '--layers', type=str, default='conv2,conv3,conv4', help='default: conv2,conv3,conv4')
@@ -165,10 +180,20 @@ def train_probe(model, ztr, ytr, zte, yte, args):
 def build_model(variant, n_classes, args):
     torch.manual_seed(args.seed)
     model = SpatialContext(args.dataset, n_classes)
+    if args.trunk == 'rotation':
+        model.color_mode = None  # rotation was trained on plain normalised images
     if variant != 'random':
         # the probe is not in the checkpoint, so a trunk trained on another dataset loads too
         ckpt = torch.load(args.ckpt, map_location='cpu', weights_only=False)
-        model.load_state_dict(remove_module_state_dict(ckpt['state_dict']))
+        state_dict = remove_module_state_dict(ckpt['state_dict'])
+        if args.trunk == 'rotation':
+            # same NiN trunk ('model.' keys), without rotation's 4-class classifier (block 4, an
+            # Identity in SpatialContext); strict loading checks that every trunk weight is transferred
+            trunk = {k[len('model.'):]: v for k, v in state_dict.items()
+                     if k.startswith('model.') and not k.startswith('model._feature_blocks.4.')}
+            model.model.load_state_dict(trunk)
+        else:
+            model.load_state_dict(state_dict)
     return model.cuda().eval()
 
 
@@ -183,13 +208,13 @@ if __name__ == '__main__':
     assert all(r in (32, patch_view) for r in resolutions), f'{resolutions}: use 32 and/or {patch_view}'
 
     if args.ckpt is None:
-        args.ckpt = osp.join('results', f'{args.dataset}_spatial_context', 'checkpoint.pth.tar')
+        args.ckpt = osp.join('results', f'{args.dataset}_{args.trunk}', 'checkpoint.pth.tar')
     if any(v != 'random' for v in variants):
         if not osp.exists(args.ckpt):
-            raise SystemExit(f'No checkpoint at {args.ckpt}. Train spatial_context on {args.dataset} first, '
+            raise SystemExit(f'No checkpoint at {args.ckpt}. Train {args.trunk} on {args.dataset} first, '
                              f'pass another one with -c (e.g. the Tiny ImageNet trunk), or use -v random.')
         ckpt = torch.load(args.ckpt, map_location='cpu', weights_only=False)
-        print(f'Checkpoint {args.ckpt}: epoch {ckpt["epoch"]}, '
+        print(f'Checkpoint {args.ckpt} ({args.trunk} trunk): epoch {ckpt["epoch"]}, '
               f'online probe test top1 {float(ckpt["best_acc"]):.2f} (on its own training dataset)', flush=True)
         del ckpt
 
@@ -221,7 +246,7 @@ if __name__ == '__main__':
             del model
             torch.cuda.empty_cache()
 
-    print(f'\nOffline linear probe on frozen features of full images '
+    print(f'\nOffline linear probe on frozen features of full images, {args.trunk} trunk '
           f'({args.dataset}, {n_classes} classes, chance {100. / n_classes:.2f}%, '
           f'{args.epochs} epochs, lr {args.lr})')
     print(f'{"variant":<10} {"input":>6} {"layer":>6} {"zeros %":>8} {"dead ch":>8} '

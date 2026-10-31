@@ -15,24 +15,39 @@ from deepul_helper.utils import accuracy, unnormalize, remove_module_state_dict,
 from deepul_helper.seg_model import SegmentationModel
 
 
-def load_model_and_data(task, dataset='cifar10'):
+def load_model_and_data(task, dataset='cifar10', ckpt_name='model_best.pth.tar', with_train_loader=True):
+    """Load a trained model, its linear classifier and the data loaders.
+
+    ckpt_name: which saved model to load from results/<dataset>_<task>/
+        'model_best.pth.tar' (default, as in the demos): the epoch with the lowest pretext loss
+        'checkpoint.pth.tar': the last epoch
+    with_train_loader: set to False when only the test set is needed (e.g. to compare the models
+        on the test set): the training images are then not loaded, which saves time.
+    The default values keep the behaviour used in the demo notebook.
+    """
     train_dset, test_dset, n_classes = get_datasets(dataset, task)
-    train_loader = data.DataLoader(train_dset, batch_size=128, num_workers=4,
-                                   pin_memory=True, shuffle=True)
+    train_loader = None
+    if with_train_loader:
+        train_loader = data.DataLoader(train_dset, batch_size=128, num_workers=4,
+                                       pin_memory=True, shuffle=True)
     test_loader = data.DataLoader(test_dset, batch_size=128, num_workers=4,
                                   pin_memory=True, shuffle=True)
 
-    ckpt_pth = osp.join('results', f'{dataset}_{task}', 'model_best.pth.tar')
+    ckpt_pth = osp.join('results', f'{dataset}_{task}', ckpt_name)
     #ckpt = torch.load(ckpt_pth, map_location='cpu')
     ckpt = torch.load(ckpt_pth, map_location='cpu',weights_only=False)
-    
-    
+
+
     if task == 'context_encoder':
         model = ContextEncoder(dataset, n_classes)
     elif task == 'rotation':
         model = RotationPrediction(dataset, n_classes)
     elif task == 'simclr':
         model = SimCLR(dataset, n_classes, None)
+    elif task == 'spatial_context':  # our new pretext task (relative position of two patches)
+        model = SpatialContext(dataset, n_classes)
+    else:
+        raise Exception('Unknown task:', task)
     model.load_state_dict(remove_module_state_dict(ckpt['state_dict']))
 
     model.cuda()
